@@ -120,7 +120,11 @@ if(BUILD_TESTING)
   find_package(ament_cmake_lint_cmake REQUIRED)
   find_package(ament_cmake_pep257 REQUIRED)
   find_package(ament_cmake_clang_format REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_xmllint REQUIRED)
+
+  ament_add_gtest(time_estimator_test test/time_estimator_test.cpp)
+  target_link_libraries(time_estimator_test synchronized_camera_driver)
 
   ament_copyright()
   ament_cppcheck(LANGUAGE c++)

@@ -241,8 +241,13 @@ void Camera::makePublishers()
 {
   metaPub_ = rclcpp::create_publisher<flir_camera_msgs::msg::ImageMetaData>(
     node_parameters_interface_, node_topics_interface_, "~/" + topicPrefix_ + "meta",
-    rclcpp::QoS(1));
+    rclcpp::QoS(metaQosDepth_));
+  unmatchedMetaPub_ = rclcpp::create_publisher<flir_camera_msgs::msg::ImageMetaData>(
+    node_parameters_interface_, node_topics_interface_, "~/" + topicPrefix_ + "meta_unmatched",
+    rclcpp::QoS(metaQosDepth_));
   pub_ = imageTransport_->advertiseCamera("~/" + topicPrefix_ + "image_raw", qosDepth_);
+  unmatchedPub_ =
+    imageTransport_->advertiseCamera("~/" + topicPrefix_ + "image_raw_unmatched", qosDepth_);
 }
 
 void Camera::makeSubscribers()
@@ -410,7 +415,10 @@ void Camera::updateStatus()
 void Camera::checkSubscriptions()
 {
   if (streamOnlyWhileSubscribed_) {
-    if (pub_.getNumSubscribers() > 0 || metaPub_->get_subscription_count() != 0) {
+    if (
+      pub_.getNumSubscribers() > 0 || unmatchedPub_.getNumSubscribers() > 0 ||
+      metaPub_->get_subscription_count() != 0 ||
+      unmatchedMetaPub_->get_subscription_count() != 0) {
       if (!cameraStreaming_) {
         startStreaming();
       }
@@ -452,6 +460,7 @@ void Camera::readParameters()
   dumpNodeMap_ = safe_declare<bool>(prefix_ + "dump_node_map", false);
   qosDepth_ = safe_declare<int>(prefix_ + "image_queue_size", 4);
   maxBufferQueueSize_ = static_cast<size_t>(safe_declare<int>(prefix_ + "buffer_queue_size", 4));
+  metaQosDepth_ = safe_declare<int>(prefix_ + "metadata_queue_size", 32);
   computeBrightness_ = safe_declare<bool>(prefix_ + "compute_brightness", false);
   acquisitionTimeout_ = safe_declare<double>(prefix_ + "acquisition_timeout", 3.0);
   parameterFile_ = safe_declare<std::string>(prefix_ + "parameter_file", "parameters.yaml");
@@ -744,8 +753,11 @@ void Camera::run()
           cv_.wait_for(lock, timeout);
         }
         if (!bufferQueue_.empty()) {
-          img = bufferQueue_.back();
-          bufferQueue_.pop_back();
+          // Preserve acquisition order. Processing the newest image first
+          // turns a short publisher stall into a reversed FrameID sequence,
+          // which the synchronized timestamp matcher must reject.
+          img = bufferQueue_.front();
+          bufferQueue_.pop_front();
         }
       }  // -------- end of locked section
       if (img && keepRunning_ && rclcpp::ok()) {
@@ -823,18 +835,29 @@ rclcpp::Time Camera::getAdjustedTimeStamp(uint64_t t, int64_t sensorTime)
 void Camera::doPublish(const ImageConstPtr & im)
 {
   rclcpp::Time t;
+  bool synchronizedTimestampValid = true;
   if (synchronizer_) {
     uint64_t t_64;
     bool haveTime = synchronizer_->getTimeStamp(
       im->time_, im->imageTime_, im->frameId_, im->numIncomplete_, &t_64);
     t = rclcpp::Time(t_64, RCL_SYSTEM_TIME);
     if (!haveTime) {
+      synchronizedTimestampValid = false;
+      // Preserve the payload without claiming synchronized timing. The raw
+      // camera clock and FrameID are carried in metadata for offline recovery;
+      // the header stamp is only a host-arrival ordering aid.
+      t = rclcpp::Time(im->time_, RCL_SYSTEM_TIME);
+      unmatchedTimestampCount_++;
       if (firstSynchronizedFrame_) {
         firstSynchronizedFrame_ = false;
-      } else {
-        LOG_WARN("cannot get time stamp for frame, dropping it");
+      } else if (
+        unmatchedTimestampCount_ == 2 || unmatchedTimestampCount_ % 120 == 0)
+      {
+        LOG_WARN(
+          "publishing frame on archival unmatched topic because synchronized timestamp is "
+          "unavailable (camera total: "
+          << unmatchedTimestampCount_ << ")");
       }
-      return;
     }
   } else {
     if (useIEEE1588_) {
@@ -848,40 +871,46 @@ void Camera::doPublish(const ImageConstPtr & im)
   imageMsg_.header.stamp = t;
   cameraInfoMsg_.header.stamp = t;
 
-  if (pub_.getNumSubscribers() > 0) {
-    bool canEncode{false};
-    const std::string encoding = flir_to_ros_encoding(im->pixelFormat_, &canEncode);
-    if (!canEncode) {
-      LOG_WARN(
-        "no ROS encoding for pixel format "
-        << spinnaker_camera_driver::pixel_format::to_string(im->pixelFormat_));
-      return;
-    }
+  // Publish continuously while the camera is active. Subscriber discovery can
+  // lag or transiently report zero during recorder startup; using the graph as
+  // an acquisition gate can therefore create silent holes or empty bags.
+  bool canEncode{false};
+  const std::string encoding = flir_to_ros_encoding(im->pixelFormat_, &canEncode);
+  if (!canEncode) {
+    LOG_WARN(
+      "no ROS encoding for pixel format "
+      << spinnaker_camera_driver::pixel_format::to_string(im->pixelFormat_));
+    return;
+  }
 
-    sensor_msgs::msg::CameraInfo::UniquePtr cinfo(new sensor_msgs::msg::CameraInfo(cameraInfoMsg_));
-    // will make deep copy. Do we need to? Probably...
-    sensor_msgs::msg::Image::UniquePtr img(new sensor_msgs::msg::Image(imageMsg_));
-    bool ret =
-      sensor_msgs::fillImage(*img, encoding, im->height_, im->width_, im->stride_, im->data_);
-    if (!ret) {
-      LOG_ERROR("fill image failed!");
-    } else {
-      // const auto t0 = node_->now();
+  sensor_msgs::msg::CameraInfo::UniquePtr cinfo(new sensor_msgs::msg::CameraInfo(cameraInfoMsg_));
+  // will make deep copy. Do we need to? Probably...
+  sensor_msgs::msg::Image::UniquePtr img(new sensor_msgs::msg::Image(imageMsg_));
+  bool ret =
+    sensor_msgs::fillImage(*img, encoding, im->height_, im->width_, im->stride_, im->data_);
+  if (!ret) {
+    LOG_ERROR("fill image failed!");
+  } else {
+    if (synchronizedTimestampValid) {
       pub_.publish(std::move(img), std::move(cinfo));
-      // const auto t1 = node_->now();
-      // std::cout << "dt: " << (t1 - t0).nanoseconds() * 1e-9 << std::endl;
       publishedCount_++;
+    } else {
+      unmatchedPub_.publish(std::move(img), std::move(cinfo));
     }
   }
-  if (metaPub_->get_subscription_count() != 0) {
-    metaMsg_.header.stamp = t;
-    metaMsg_.brightness = im->brightness_;
-    metaMsg_.exposure_time = im->exposureTime_;
-    metaMsg_.max_exposure_time = im->maxExposureTime_;
-    metaMsg_.gain = im->gain_;
-    metaMsg_.camera_time = im->imageTime_;
-    metaMsg_.line_status = im->exposureEndLineStatus;
+  metaMsg_.header.stamp = t;
+  metaMsg_.brightness = im->brightness_;
+  metaMsg_.exposure_time = im->exposureTime_;
+  metaMsg_.max_exposure_time = im->maxExposureTime_;
+  metaMsg_.gain = im->gain_;
+  metaMsg_.camera_time = im->imageTime_;
+  metaMsg_.camera_frame_id = im->frameId_;
+  metaMsg_.synchronized_timestamp_valid = synchronizedTimestampValid;
+  metaMsg_.line_status = im->exposureEndLineStatus;
+  if (synchronizedTimestampValid) {
     metaPub_->publish(metaMsg_);
+  } else {
+    unmatchedMetaPub_->publish(metaMsg_);
   }
   numIncompletes_ += im->numIncomplete_;
   if (lastFrameId_ == 0) {
@@ -949,7 +978,9 @@ void Camera::destroySubscribers() { controlSub_.reset(); }
 void Camera::destroyPublishers()
 {
   metaPub_.reset();
+  unmatchedMetaPub_.reset();
   pub_.shutdown();
+  unmatchedPub_.shutdown();
 }
 
 void Camera::startDiagnostics()

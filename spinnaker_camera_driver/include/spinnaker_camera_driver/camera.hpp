@@ -177,7 +177,10 @@ private:
   image_transport::ImageTransport * imageTransport_{nullptr};
   camera_info_manager::CameraInfoManager * infoManager_{nullptr};
   image_transport::CameraPublisher pub_;
+  image_transport::CameraPublisher unmatchedPub_;
   rclcpp::Publisher<flir_camera_msgs::msg::ImageMetaData>::SharedPtr metaPub_;
+  rclcpp::Publisher<flir_camera_msgs::msg::ImageMetaData>::SharedPtr
+    unmatchedMetaPub_;
   std::string serial_;
   std::string logName_;
   std::string name_;
@@ -227,10 +230,12 @@ private:
   std::atomic<uint32_t> droppedCount_{0};
   std::atomic<uint32_t> queuedCount_{0};
   rclcpp::Time lastStatusTime_;
+  int metaQosDepth_{32};
   int qosDepth_{4};
   std::shared_ptr<Synchronizer> synchronizer_;
   std::shared_ptr<ExposureController> exposureController_;
   bool firstSynchronizedFrame_{true};
+  uint64_t unmatchedTimestampCount_{0};
   bool runStatusTimer_{false};
   // --------- related to diagnostics
   std::shared_ptr<diagnostic_updater::Updater> updater_;

@@ -16,6 +16,10 @@
 #include <spinnaker_synchronized_camera_driver/logging.hpp>
 #include <spinnaker_synchronized_camera_driver/time_estimator.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
 // #define DEBUG
 
 static rclcpp::Logger get_logger() { return (rclcpp::get_logger("cam_sync")); }
@@ -24,6 +28,13 @@ namespace spinnaker_synchronized_camera_driver
 {
 void TimeEstimator::initialize(uint64_t t0, double dt)
 {
+  if (!std::isfinite(dt) || dt < 1e-6 || dt > 1.0) {
+    LOG_WARN(
+      "invalid frame interval " << dt << " seconds; using "
+                                << DEFAULT_FRAME_INTERVAL_SECONDS << " seconds");
+    dt = DEFAULT_FRAME_INTERVAL_SECONDS;
+  }
+  nominalFrameInterval_ = dt;
   T0_ = t0;
   x_[0] = 0;
   x_[1] = dt;
@@ -34,8 +45,14 @@ void TimeEstimator::initialize(uint64_t t0, double dt)
   // or else the
   P_[0][0] = P_[1][1] = P_[0][1] = P_[1][0] = Q_;
   R_ = measurementSigma * measurementSigma;
+  frameTimes_.clear();
   LOG_INFO_FMT("frequency estimator initialized with %.3f Hz", 1.0 / dt);
   frameTimes_.push_back(FrameTime(0));
+}
+
+void TimeEstimator::resetAt(uint64_t t)
+{
+  initialize(t, nominalFrameInterval_);
 }
 
 void TimeEstimator::updateKalman(double z)
@@ -98,15 +115,68 @@ bool TimeEstimator::getTimeFromList(uint64_t t_a, uint64_t * T)
     LOG_INFO_FMT("   %8ld", tl.getFrameTime());
   }
 #endif
-  constexpr size_t MAX_NUM_FRAMES_TO_KEEP = 5;
-  const auto t = static_cast<int64_t>(t_a);
+  // A camera callback may legitimately trail the other five cameras by the
+  // configured 10-frame FIFO depth. Keep substantial headroom for brief
+  // six-camera scheduling stalls while retaining the independent bound on
+  // forward estimator work. These are tiny timestamp records, not images.
+  constexpr size_t MAX_NUM_FRAMES_TO_KEEP = 32;
+  if (frameTimes_.empty()) {
+    resetAt(t_a);
+    *T = t_a;
+    return (false);
+  }
+
+  // All cameras share this estimator. A timestamp a fraction of a frame older
+  // than the current epoch can therefore be a normal late arrival. A larger
+  // rewind means the source clock reset and the old estimator is no longer
+  // usable.
+  const auto lateArrivalTolerance = static_cast<uint64_t>(
+    std::max(1e-3, nominalFrameInterval_ * 2.0) * 1e9);
+  if (t_a < T0_ && T0_ - t_a > lateArrivalTolerance) {
+    LOG_WARN("camera host timestamp moved backwards; resetting time estimator");
+    resetAt(t_a);
+    *T = t_a;
+    return (false);
+  }
+
+  const uint64_t relativeTime = t_a >= T0_ ? t_a - T0_ : 0;
+  if (relativeTime > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    LOG_WARN("camera host timestamp exceeded estimator range; resetting time estimator");
+    resetAt(t_a);
+    *T = t_a;
+    return (false);
+  }
+  if (!std::isfinite(x_[0]) || !std::isfinite(x_[1]) || x_[1] < 1e-6 || x_[1] > 1.0) {
+    LOG_WARN("camera frame-period estimate became invalid; resetting time estimator");
+    resetAt(t_a);
+    *T = t_a;
+    return (false);
+  }
+
+  const auto t = static_cast<int64_t>(relativeTime);
   const auto dT = static_cast<int64_t>(x_[1] * 1e9);
+  const auto latestFrameTime = (*frameTimes_.rbegin()).getFrameTime();
+  if (
+    t > latestFrameTime &&
+    static_cast<uint64_t>(t - latestFrameTime) / static_cast<uint64_t>(dT) >
+      MAX_ESTIMATOR_ADVANCE_STEPS)
+  {
+    LOG_WARN("camera timestamp discontinuity exceeded safe advance; resetting time estimator");
+    resetAt(t_a);
+    *T = t_a;
+    return (false);
+  }
   const auto T_min = (*frameTimes_.begin()).getFrameTime();
   const int64_t dT_min = static_cast<int64_t>(T_min) - static_cast<int64_t>(t);
 
   if (dT_min * 2 > dT) {
     // far away from the oldest frame time
-    LOG_WARN("dropping very old frame!");
+    oldFrameRejectionCount_++;
+    if (oldFrameRejectionCount_ == 1 || oldFrameRejectionCount_ % 120 == 0) {
+      LOG_WARN(
+        "rejecting frame older than timestamp history (total: "
+        << oldFrameRejectionCount_ << ")");
+    }
     return (false);
   }
 
@@ -121,19 +191,37 @@ bool TimeEstimator::getTimeFromList(uint64_t t_a, uint64_t * T)
   }
 
   // make sure to add new frames if needed
-  for (auto ft = *(frameTimes_.rbegin()); (t - ft.getFrameTime()) * 2 > dT;
+  size_t advanceSteps = 0;
+  for (auto ft = *(frameTimes_.rbegin());
+       t > ft.getFrameTime() && t - ft.getFrameTime() > dT / 2;
        ft = *(frameTimes_.rbegin())) {
+    // The list is trimmed only after this loop. Without this bound, a bad
+    // timestamp or Kalman period can make one callback allocate until the host
+    // is OOM-killed. This is a computation/memory bound, not a reorder window.
+    if (advanceSteps++ >= MAX_ESTIMATOR_ADVANCE_STEPS) {
+      LOG_WARN("camera timestamp jumped ahead; resetting time estimator");
+      resetAt(t_a);
+      *T = t_a;
+      return (false);
+    }
     // if a new frame is found, perform a measurement update
     // based on the average arrival time of the last frames that
     // have arrived before the new frame
     if (ft.isValid()) {
       updateKalman(ft.getAverageFrameTime());
     }
+    const auto previousTime = ft.getFrameTime();
     const auto nextTime = predict();
+    if (nextTime <= previousTime) {
+      LOG_WARN("camera frame-period prediction stopped advancing; resetting time estimator");
+      resetAt(t_a);
+      *T = t_a;
+      return (false);
+    }
     frameTimes_.push_back(FrameTime(nextTime));
   }
 
-  while (frameTimes_.size() >= MAX_NUM_FRAMES_TO_KEEP) {
+  while (frameTimes_.size() > MAX_NUM_FRAMES_TO_KEEP) {
     frameTimes_.pop_front();
   }
 
@@ -196,8 +284,7 @@ bool TimeEstimator::getTimeFromList(uint64_t t_a, uint64_t * T)
 bool TimeEstimator::update(size_t idx, uint64_t t_a, uint64_t * frameTime)
 {
   (void)idx;
-  const uint64_t t_a_0 = (t_a >= T0_) ? (t_a - T0_) : 0;
-  const bool gotValidTime = getTimeFromList(t_a_0, frameTime);
+  const bool gotValidTime = getTimeFromList(t_a, frameTime);
   return (gotValidTime);
 }
 }  // namespace spinnaker_synchronized_camera_driver

@@ -32,6 +32,9 @@ public:
   bool update(size_t idx, uint64_t t, uint64_t * frameTime);
 
 private:
+  static constexpr size_t MAX_ESTIMATOR_ADVANCE_STEPS = 32;
+  static constexpr double DEFAULT_FRAME_INTERVAL_SECONDS = 1.0 / 120.0;
+
   class FrameTime
   {
   public:
@@ -57,6 +60,7 @@ private:
     size_t numFrames_{0};
   };
   bool getTimeFromList(uint64_t t, uint64_t * T);
+  void resetAt(uint64_t t);
   void updateKalman(double z);
   int64_t predict();
   using Vec2d = std::array<double, 2>;
@@ -66,7 +70,9 @@ private:
   double R_{0};
   double Q_{0};
   uint64_t T0_{0};
+  double nominalFrameInterval_{DEFAULT_FRAME_INTERVAL_SECONDS};
   std::list<FrameTime> frameTimes_;
+  uint64_t oldFrameRejectionCount_{0};
 };
 }  // namespace spinnaker_synchronized_camera_driver
 #endif  // SPINNAKER_SYNCHRONIZED_CAMERA_DRIVER__TIME_ESTIMATOR_HPP_
