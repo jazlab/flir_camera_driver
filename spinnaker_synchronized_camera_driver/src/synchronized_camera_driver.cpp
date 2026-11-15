@@ -118,6 +118,10 @@ void SynchronizedCameraDriver::shutdown()
 
 void SynchronizedCameraDriver::printStatus()
 {
+  // Always report acquisition counters, even while the matcher is warming up.
+  for (auto & camera : cameras_) {
+    camera.second->logPipelineStatistics();
+  }
   if (numUpdatesReceived_ < numUpdatesRequired_) {
     LOG_INFO("waiting for accurate frequency, current estimate: " << 1.0 / avgFrameInterval_);
     return;

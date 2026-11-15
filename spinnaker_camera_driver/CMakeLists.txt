@@ -205,6 +205,9 @@ install(PROGRAMS
 
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(pipeline_counters_test test/pipeline_counters_test.cpp)
+  target_include_directories(pipeline_counters_test PRIVATE include)
   find_package(ament_cmake REQUIRED)
   find_package(ament_cmake_copyright REQUIRED)
   find_package(ament_cmake_cppcheck REQUIRED)

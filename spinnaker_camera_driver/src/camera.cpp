@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <image_transport/image_transport.hpp>
@@ -728,12 +729,14 @@ void Camera::processImage(const ImageConstPtr & im)
   {
     std::unique_lock<std::mutex> lock(mutex_);
     queuedCount_++;
-    if (bufferQueue_.size() < maxBufferQueueSize_) {
+    const bool accepted = bufferQueue_.size() < maxBufferQueueSize_;
+    if (accepted) {
       bufferQueue_.push_back(im);
       cv_.notify_all();
     } else {
       droppedCount_++;
     }
+    pipelineCounters_.ingress(accepted, bufferQueue_.size());
     if (imageArrivalDiagnostic_) {
       imageArrivalDiagnostic_->tick();
     }
@@ -761,7 +764,29 @@ void Camera::run()
         }
       }  // -------- end of locked section
       if (img && keepRunning_ && rclcpp::ok()) {
-        doPublish(img);
+        const auto age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::high_resolution_clock::now().time_since_epoch()).count() -
+          static_cast<int64_t>(img->time_);
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          pipelineCounters_.dequeue(static_cast<uint64_t>(std::max<int64_t>(0, age_ns) / 1000));
+        }
+        const auto wall_start = std::chrono::steady_clock::now();
+        struct timespec cpu_start{}, cpu_end{};
+        const bool cpu_clock_valid = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
+        const auto outcome = doPublish(img);
+        const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - wall_start).count();
+        const bool cpu_end_valid = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
+        const int64_t cpu_ns = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000000000LL +
+          cpu_end.tv_nsec - cpu_start.tv_nsec;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          pipelineCounters_.published(
+            outcome, static_cast<uint64_t>(wall_us),
+            cpu_clock_valid && cpu_end_valid ?
+            static_cast<uint64_t>(std::max<int64_t>(0, cpu_ns) / 1000) : 0);
+        }
         if (exposureController_) {
           exposureController_->update(this, img);
         }
@@ -832,7 +857,7 @@ rclcpp::Time Camera::getAdjustedTimeStamp(uint64_t t, int64_t sensorTime)
   return (adjustedTime);
 }
 
-void Camera::doPublish(const ImageConstPtr & im)
+PipelineCounters::Outcome Camera::doPublish(const ImageConstPtr & im)
 {
   rclcpp::Time t;
   bool synchronizedTimestampValid = true;
@@ -880,7 +905,7 @@ void Camera::doPublish(const ImageConstPtr & im)
     LOG_WARN(
       "no ROS encoding for pixel format "
       << spinnaker_camera_driver::pixel_format::to_string(im->pixelFormat_));
-    return;
+    return PipelineCounters::Outcome::FAILED;
   }
 
   sensor_msgs::msg::CameraInfo::UniquePtr cinfo(new sensor_msgs::msg::CameraInfo(cameraInfoMsg_));
@@ -923,6 +948,46 @@ void Camera::doPublish(const ImageConstPtr & im)
   if (topicDiagnostic_) {
     topicDiagnostic_->tick(t);
   }
+  return !ret ? PipelineCounters::Outcome::FAILED :
+         (synchronizedTimestampValid ? PipelineCounters::Outcome::MAIN :
+         PipelineCounters::Outcome::UNMATCHED);
+}
+
+void Camera::logPipelineStatistics()
+{
+  if (!wrapper_) {return;}
+  // Fetch SDK counters before taking the queue lock. The SDK callback takes
+  // these locks in that order; never invert them. No image payload is copied.
+  SpinnakerWrapper::Stats sdk;
+  wrapper_->getAndClearStatistics(&sdk);
+  PipelineCounters stats;
+  size_t depth;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pipelineCounters_.sdk_received += sdk.numberReceived;
+    pipelineCounters_.sdk_skipped += sdk.numberSkipped;
+    pipelineCounters_.sdk_incomplete += sdk.numberIncomplete;
+    pipelineCounters_.sdk_timeouts += sdk.acquisitionTimeouts;
+    depth = bufferQueue_.size();
+    stats = pipelineCounters_.snapshot(depth);
+  }
+  LOG_INFO(
+    "[FLIR_PIPELINE] camera=" << logName_
+    << " sdk_received=" << stats.sdk_received << " sdk_skipped=" << stats.sdk_skipped
+    << " sdk_incomplete=" << stats.sdk_incomplete << " sdk_timeouts=" << stats.sdk_timeouts
+    << " callbacks=" << stats.callbacks << " enqueued=" << stats.enqueued
+    << " queue_dropped=" << stats.queue_dropped << " dequeued=" << stats.dequeued
+    << " queue_depth=" << depth << " queue_limit=" << maxBufferQueueSize_
+    << " queue_peak=" << stats.queue_peak << " queue_peak_interval=" << stats.interval_queue_peak
+    << " published_main=" << stats.published_main << " published_unmatched=" << stats.published_unmatched
+    << " publish_failed=" << stats.publish_failed << " publish_calls=" << stats.publish_calls
+    << " publish_wall_us=" << stats.publish_wall_us << " publish_cpu_us=" << stats.publish_cpu_us
+    << " publish_wall_us_max=" << stats.publish_wall_us_max
+    << " publish_cpu_us_max=" << stats.publish_cpu_us_max
+    << " callback_age_us_max=" << stats.callback_age_us_max
+    << " publish_wall_us_max_interval=" << stats.interval_wall_us_max
+    << " publish_cpu_us_max_interval=" << stats.interval_cpu_us_max
+    << " callback_age_us_max_interval=" << stats.interval_age_us_max);
 }
 
 void Camera::printCameraInfo()

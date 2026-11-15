@@ -33,6 +33,7 @@
 #include <spinnaker_camera_driver/diagnostic_levels.hpp>
 #include <spinnaker_camera_driver/image.hpp>
 #include <spinnaker_camera_driver/lifecycle_types.hpp>
+#include <spinnaker_camera_driver/pipeline_counters.hpp>
 #include <spinnaker_camera_driver/spinnaker_wrapper.hpp>
 #include <spinnaker_camera_driver/synchronizer.hpp>
 #include <std_msgs/msg/float64.hpp>
@@ -70,6 +71,8 @@ public:
   }
   const std::string & getName() const { return (name_); }
   const std::string & getPrefix() const { return (prefix_); }
+  // Called by the existing low-rate synchronized-driver status timer.
+  void logPipelineStatistics();
 
   bool configure();    // corresponds to lifecycle configure
   bool activate();     // corresponds to lifecycle activate
@@ -120,7 +123,7 @@ private:
   void controlCallback(const flir_camera_msgs::msg::CameraControl::UniquePtr msg);
   void updateStatus();
   void checkSubscriptions();
-  void doPublish(const ImageConstPtr & im);
+  PipelineCounters::Outcome doPublish(const ImageConstPtr & im);
   rclcpp::Logger get_logger() { return (rclcpp::get_logger(logName_)); }
 
   template <class T>
@@ -221,6 +224,7 @@ private:
   std::condition_variable cv_;
   std::deque<ImageConstPtr> bufferQueue_;
   size_t maxBufferQueueSize_{4};
+  PipelineCounters pipelineCounters_;  // protected by mutex_
   std::shared_ptr<std::thread> thread_;
   bool keepRunning_{true};
   std::map<std::string, NodeInfo> parameterMap_;
